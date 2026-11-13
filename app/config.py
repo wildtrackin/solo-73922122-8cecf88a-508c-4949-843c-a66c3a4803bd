@@ -36,6 +36,17 @@ BACKGROUND_CLEANUP_ENABLED = _flag("BACKGROUND_CLEANUP_ENABLED", True)
 DELETE_FAIL_PARTITIONS = {
     x.strip() for x in os.environ.get("DELETE_FAIL_PARTITIONS", "").split(",") if x.strip()
 }
+# 慢删除注入（仅用于演示/测试）：逗号分隔的分区号，删除这些分区的文件前先睡眠 SLOW_DELETE_SECONDS 秒。
+# 删除在数据库事务之外进行（不持 SQLite 写锁），用它制造“删除进行中”的观察窗口。
+SLOW_DELETE_PARTITIONS = {
+    x.strip() for x in os.environ.get("SLOW_DELETE_PARTITIONS", "").split(",") if x.strip()
+}
+SLOW_DELETE_SECONDS = float(os.environ.get("SLOW_DELETE_SECONDS", "8"))
+
+# 单调钟宿主启动周期标识来源（Linux /proc）；同宿主所有容器读数一致
+BOOT_ID_PATH = os.environ.get("BOOT_ID_PATH", "/proc/sys/kernel/random/boot_id")
+# 墙钟校时演示：偏移写入该文件（DATA_DIR 下、两进程共享），改文件即模拟一次校时
+CLOCK_OFFSET_FILE = os.environ.get("CLOCK_OFFSET_FILE", str(DATA_DIR / "clock-offset"))
 
 PROCESS_NAME = os.environ.get("PROCESS_NAME") or socket.gethostname()
 OWNER = f"{PROCESS_NAME}:{os.getpid()}"

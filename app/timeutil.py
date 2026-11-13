@@ -1,12 +1,18 @@
-"""时间工具：API 层使用 ISO 8601，存储层统一使用 UTC  epoch 毫秒（整数）。"""
+"""时间工具：API 层使用 ISO 8601，存储层日历时间统一使用 UTC epoch 毫秒（整数）。
+
+注意：这里的 now_ms 是**墙钟**，只用于业务日历时间（分区 expires_at、
+created/cleaned 等 UTC 字段）。清理租约与重试期限使用单调钟
+（app/clock.py），与墙钟校时完全解耦。
+"""
 from __future__ import annotations
 
-import time
 from datetime import datetime, timezone
+
+from .clock import wall_now_ms
 
 
 def now_ms() -> int:
-    return int(time.time() * 1000)
+    return wall_now_ms()
 
 
 def to_utc(dt: datetime) -> datetime:

@@ -105,19 +105,28 @@ class CleanupRunResult(BaseModel):
 class InFlightDelete(BaseModel):
     partition_id: str
     owner: str | None
-    lease_expires_at: str | None
+    lease_expires_at: str | None = Field(
+        default=None, description="租约到期时刻（UTC 墙钟预估，仅展示；期限实际按单调钟经过时长判定）"
+    )
+    lease_total_seconds: float = Field(description="租约总时长（秒）")
+    lease_elapsed_seconds: float = Field(description="租约已经过的实际时长（秒，墙钟校时不影响）")
+    lease_remaining_seconds: float = Field(description="租约剩余实际时长（秒，墙钟校时不影响）")
     attempts: int
 
 
 class DeleteFailure(BaseModel):
     partition_id: str
     attempts: int
-    last_error: str | None
+    last_error: str | None = None
+    retry_remaining_seconds: float | None = Field(
+        default=None, description="距下次可重试的实际剩余秒数（单调钟，墙钟校时不影响）；旧记录迁移后为 null 表示立即可重试"
+    )
 
 
 class CleanupStatus(BaseModel):
     process: str = Field(description="回答本次请求的进程")
     now: str
+    clock: "ClockInfo" = Field(description="时钟基座信息：单调钟与宿主启动周期")
     counts: dict[str, int] = Field(description="按分区状态统计")
     pending_expired_unpreserved: int = Field(description="已到期且无保全、等待清理的分区数")
     in_flight: list[InFlightDelete] = Field(description="删除资格已发出、删除进行中的分区")
@@ -128,3 +137,15 @@ class CleanupStatus(BaseModel):
     last_run: CleanupRunResult | None = Field(
         default=None, description="本进程最近一次清理 pass（另一进程可能另有其记录）"
     )
+
+
+class ClockInfo(BaseModel):
+    boot_id: str = Field(description="宿主启动周期标识；同一宿主全部容器一致，宿主重启后变化")
+    monotonic_ns: int = Field(description="当前单调钟读数（纳秒，实际经过时长基座）")
+    wall_offset_seconds: float = Field(description="墙钟演示偏移（秒）；不影响单调钟期限")
+    delete_lease_seconds: float
+    delete_retry_seconds: float
+
+
+# 解析前向引用
+CleanupStatus.model_rebuild()

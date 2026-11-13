@@ -1,0 +1,44 @@
+# 校时/锁等待/重启演示用覆盖配置：
+#   docker compose -f docker-compose.yml -f docker-compose.demo.yml up --build
+# 与基础配置共享同一 lake-data 卷；仅把期限调短并打开演示用注入，
+# 不修改任何宿主时间、不改变清理语义。
+services:
+  api-a:
+    environment:
+      CLEANUP_INTERVAL_SECONDS: "2"
+      DELETE_LEASE_SECONDS: "10"
+      # 重试间隔取 20s：校时演示窗口内 delete_failed 记录保持可见，
+      # 重启演示阶段（约 30s 后）又能观察到自动重试恢复
+      DELETE_RETRY_SECONDS: "20"
+      # 慢删除注入：认领后删除文件前睡眠 6s（不持 SQLite 写锁），制造租约观察窗口
+      SLOW_DELETE_PARTITIONS: "P0001"
+      SLOW_DELETE_SECONDS: "6"
+      # 校时演示偏移文件（位于共享卷，两个进程读取同一份）
+      CLOCK_OFFSET_FILE: "/data/clock-offset"
+
+  api-b:
+    environment:
+      CLEANUP_INTERVAL_SECONDS: "2"
+      DELETE_LEASE_SECONDS: "10"
+      DELETE_RETRY_SECONDS: "20"
+      CLOCK_OFFSET_FILE: "/data/clock-offset"
+
+  # 故障注入演示进程：删除 P0004 必失败（delete_failed 路径）。
+  # 仅在显式带上 --profile faildemo 时启动；与 api-a/api-b 共享同一数据卷。
+  #   docker compose -f docker-compose.yml -f docker-compose.demo.yml \
+  #       --profile faildemo run --rm api-fail
+  api-fail:
+    profiles: ["faildemo"]
+    build: .
+    environment:
+      PROCESS_NAME: api-fail
+      DATA_DIR: /data
+      CLEANUP_INTERVAL_SECONDS: "2"
+      DELETE_LEASE_SECONDS: "10"
+      DELETE_RETRY_SECONDS: "20"
+      DELETE_FAIL_PARTITIONS: "P0004"
+      CLOCK_OFFSET_FILE: "/data/clock-offset"
+    volumes:
+      - lake-data:/data
+    ports:
+      - "8003:8000"

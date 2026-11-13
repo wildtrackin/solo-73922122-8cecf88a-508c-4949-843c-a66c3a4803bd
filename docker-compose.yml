@@ -10,6 +10,7 @@ services:
       # 手动 POST /cleanup/run 随时立即生效
       CLEANUP_INTERVAL_SECONDS: "120"
       DELETE_LEASE_SECONDS: "30"
+      DELETE_RETRY_SECONDS: "30"
       # 演示删除失败路径时可打开（逗号分隔分区号）：
       # DELETE_FAIL_PARTITIONS: "P0004"
     volumes:
@@ -32,6 +33,7 @@ services:
       # 手动 POST /cleanup/run 随时立即生效
       CLEANUP_INTERVAL_SECONDS: "120"
       DELETE_LEASE_SECONDS: "30"
+      DELETE_RETRY_SECONDS: "30"
     volumes:
       - lake-data:/data
     ports:

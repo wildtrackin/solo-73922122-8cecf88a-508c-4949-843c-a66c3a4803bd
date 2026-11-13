@@ -36,12 +36,17 @@ SCHEMA_STATEMENTS = [
                           CHECK (status IN ('active','deleting','delete_failed','cleaned')),
         file_materialized INTEGER NOT NULL DEFAULT 0,  -- 种子文件是否已落盘
         delete_owner      TEXT,               -- 持有删除资格的进程
-        delete_lease_ms   INTEGER,            -- 删除资格租约到期时刻（epoch ms）
-        next_retry_ms     INTEGER,            -- 删除失败后的下次可重试时刻（epoch ms）
+        delete_lease_ms   INTEGER,            -- 旧版墙钟租约展示字段（保留兼容，期限不再按它判定）
+        next_retry_ms     INTEGER,            -- 旧版墙钟重试展示字段（保留兼容，期限不再按它判定）
         delete_attempts   INTEGER NOT NULL DEFAULT 0,
         last_error        TEXT,               -- 最近一次删除失败原因
         created_ms        INTEGER NOT NULL,
-        cleaned_ms        INTEGER
+        cleaned_ms        INTEGER,
+        -- 单调钟期限（CLOCK_MONOTONIC_RAW 纳秒）：租约/重试按实际经过时长判定，
+        -- 与墙钟校时解耦；配套 boot 标识，宿主重启后旧期限立即视为到期。
+        delete_lease_mono_ns  INTEGER,        -- 删除租约到期的单调钟时刻（纳秒）
+        next_retry_mono_ns    INTEGER,        -- 下次可重试的单调钟时刻（纳秒）
+        deadline_boot_id      TEXT            -- 写入上述单调期限时的宿主启动周期标识
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_partitions_vehicle ON partitions(vehicle_id, start_ms, end_ms)",
@@ -110,11 +115,30 @@ def read_conn() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+# 旧库（仅墙钟期限列）在线迁移：补齐单调钟期限列。
+# 已有的 deleting/delete_failed 行新列为 NULL，认领 SQL 将其视为“期限已到”，
+# 下一轮清理即可接管，保证校时修复上线后旧记录可恢复、不卡死。
+MIGRATION_COLUMNS = [
+    ("delete_lease_mono_ns", "INTEGER"),
+    ("next_retry_mono_ns", "INTEGER"),
+    ("deadline_boot_id", "TEXT"),
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(partitions)")}
+    for name, decl in MIGRATION_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE partitions ADD COLUMN {name} {decl}")
+
+
 def init_db() -> None:
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     (config.DATA_DIR / config.PARTITIONS_SUBDIR).mkdir(parents=True, exist_ok=True)
     config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # CREATE ... IF NOT EXISTS 幂等，多进程并发建表安全
-    with read_conn() as conn:
+    # CREATE ... IF NOT EXISTS 幂等，多进程并发建表安全；
+    # 结构迁移放在 IMMEDIATE 事务里，跨进程串行且幂等。
+    with immediate_txn() as conn:
         for stmt in SCHEMA_STATEMENTS:
             conn.execute(stmt)
+        _migrate(conn)

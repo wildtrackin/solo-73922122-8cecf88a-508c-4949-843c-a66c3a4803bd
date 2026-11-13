@@ -7,12 +7,19 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from .. import config
+from .. import clock, config
 from ..db import read_conn
 from ..models import PartitionOut, Sample, SamplesResponse
 from ..timeutil import dt_to_ms, iso_to_ms, ms_to_iso, now_ms
 
 router = APIRouter(tags=["分区与波形"])
+
+
+def _lease_expires_iso(row) -> str | None:
+    """租约到期展示时间：优先用单调钟期限折算墙钟；旧版行退回墙钟列。"""
+    if row["delete_lease_mono_ns"] is not None:
+        return ms_to_iso(clock.mono_to_wall_ms(row["delete_lease_mono_ns"]))
+    return ms_to_iso(row["delete_lease_ms"])
 
 
 def _partition_out(row) -> PartitionOut:
@@ -29,7 +36,7 @@ def _partition_out(row) -> PartitionOut:
         active_preservations=row["active_preservations"],
         delete_attempts=row["delete_attempts"],
         delete_owner=row["delete_owner"],
-        delete_lease_expires_at=ms_to_iso(row["delete_lease_ms"]),
+        delete_lease_expires_at=_lease_expires_iso(row),
         last_error=row["last_error"],
         cleaned_at=ms_to_iso(row["cleaned_ms"]),
     )

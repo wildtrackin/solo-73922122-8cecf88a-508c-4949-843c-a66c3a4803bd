@@ -20,11 +20,15 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 PY = str(ROOT / ".venv" / "bin" / "python")
 BASE_PORT = 9500
 RUN_STAMP = f"{os.getpid()}"
 FAILURES: list[str] = []
 PASSES: list[str] = []
+
+# 测试进程与服务器进程在同一宿主上，单调钟与 boot_id 同源
+from app import clock  # noqa: E402
 
 
 def ok(name: str, cond: bool, detail: str = "") -> None:
@@ -65,6 +69,8 @@ class Server:
             "CLEANUP_INTERVAL_SECONDS": "2",
             "DELETE_LEASE_SECONDS": "4",
             "DELETE_RETRY_SECONDS": "3",
+            # 校时演示偏移经共享文件注入，两个进程读取同一份
+            "CLOCK_OFFSET_FILE": str(self.data_dir / "clock-offset"),
             "SERVER_LIFETIME": str(self.lifetime),
             "PORT": str(self.port),
         })
@@ -116,7 +122,11 @@ def partition_status(port: int, pid: str) -> dict:
 
 
 def db_set_deleting(data_dir: Path, pid: str, lease_delay_s: float, delete_file: bool) -> None:
-    """模拟崩溃的删除者：行卡在 deleting；可选地让文件已删（崩溃于两个不同阶段）。"""
+    """模拟崩溃的删除者（旧版墙钟记录）：行卡在 deleting，单调列为 NULL。
+
+    迁移后的认领逻辑把“单调期限缺失”视为已到期，验证已有 deleting 记录可恢复。
+    可选地让文件已删（崩溃于两个不同阶段）。
+    """
     conn = sqlite3.connect(str(data_dir / "datalake.db"), isolation_level=None)
     lease = int((time.time() + lease_delay_s) * 1000)
     conn.execute(
@@ -127,6 +137,34 @@ def db_set_deleting(data_dir: Path, pid: str, lease_delay_s: float, delete_file:
     conn.close()
     if delete_file:
         (data_dir / "partitions" / f"{pid}.jsonl").unlink()
+
+
+def db_set_deleting_mono(data_dir: Path, pid: str, lease_delay_s: float) -> None:
+    """模拟崩溃的删除者（新版单调钟记录）：租约按实际经过时长 lease_delay_s 后到期。"""
+    conn = sqlite3.connect(str(data_dir / "datalake.db"), isolation_level=None)
+    conn.execute(
+        "UPDATE partitions SET status='deleting', delete_owner='ghost:1', "
+        "delete_lease_mono_ns=?, deadline_boot_id=?, delete_lease_ms=NULL, "
+        "delete_attempts=delete_attempts+1 WHERE partition_id=?",
+        (clock.mono_seconds_after(lease_delay_s), clock.boot_id(), pid),
+    )
+    conn.close()
+
+
+def set_clock_offset(data_dir: Path, seconds: float) -> None:
+    """写入墙钟偏移（秒）：模拟一次校时；单调钟不受影响。无需修改宿主时间。"""
+    (data_dir / "clock-offset").write_text(f"{seconds}\n", encoding="ascii")
+
+
+def wait_for_status(port: int, pid: str, wanted: str, timeout_s: float) -> dict:
+    deadline = time.time() + timeout_s
+    st: dict = {}
+    while time.time() < deadline:
+        st = partition_status(port, pid)
+        if st["status"] == wanted:
+            return st
+        time.sleep(0.3)
+    return st
 
 
 # ---------------------------------------------------------------- 场景 1：重启幂等
@@ -335,6 +373,173 @@ def scenario_operable_during_cleanup() -> None:
     ok("S7 状态接口在清理期间可用", "counts" in st)
 
 
+# --------------------------------- S8：墙钟校时不改变清理期限（单调钟判定）
+def scenario_clock_jump_immunity() -> None:
+    print("== S8 墙钟前后跳：租约不被提前接管、重试不被推迟/提前 ==")
+
+    # --- S8a 租约：向前校时 1 小时，未满 30s（测试中为 4s）的租约不得被接管 ---
+    d = fresh_dir("lk-s8a")
+    a = Server(d, "s8a", lifetime=40, BACKGROUND_CLEANUP_ENABLED="false",
+               SLOW_DELETE_PARTITIONS="P0001", SLOW_DELETE_SECONDS="3").start()
+    b = Server(d, "s8b", lifetime=40, BACKGROUND_CLEANUP_ENABLED="false").start()
+    t0 = time.time()
+    # a 在后台线程认领 P0001 并卡在慢删除里（事务已提交、锁已释放、租约生效中）
+    threading.Thread(
+        target=lambda: http("POST", a.port, "/cleanup/run"), daemon=True
+    ).start()
+    st = wait_for_status(b.port, "P0001", "deleting", 4)
+    ok("S8a 慢删除期间分区处于 deleting", st.get("status") == "deleting", st.get("status", ""))
+    # 向前校时 +3600s（仅墙钟，单调钟不动）
+    set_clock_offset(d, 3600)
+    time.sleep(0.5)
+    _, h = http("GET", b.port, "/health")
+    ok("S8a 墙钟确实向前跳 1 小时", abs(h["wall_offset_seconds"] - 3600) < 0.01, str(h.get("wall_offset_seconds")))
+    code, res = http("POST", b.port, "/cleanup/run")
+    p1 = partition_status(b.port, "P0001")
+    ok("S8a 前跳后租约未到期：另一进程不得接管 P0001",
+       code == 200 and p1["status"] == "deleting" and p1["delete_owner"].startswith("s8a"),
+       f"{p1['status']} owner={p1['delete_owner']} outcomes={[o['partition_id'] for o in res['outcomes']]}")
+    _, cst = http("GET", b.port, "/cleanup/status")
+    inflight = next(x for x in cst["in_flight"] if x["partition_id"] == "P0001")
+    ok("S8a 租约剩余时长按单调钟继续走（仍 >0）", inflight["lease_remaining_seconds"] > 0,
+       str(inflight["lease_remaining_seconds"]))
+    # 慢删除结束后由持有进程自己收敛为 cleaned（接管窗口从未因校时而提前打开）
+    final = wait_for_status(a.port, "P0001", "cleaned", 8)
+    ok("S8a 慢删除结束后持有进程自行完成回收（未发生提前接管）",
+       final.get("status") == "cleaned", f"{final.get('status')} elapsed={time.time() - t0:.1f}s")
+
+    # --- S8b 重试：向后校时 1 小时，已到重试时间的失败分区不得继续等待 ---
+    d = fresh_dir("lk-s8b")
+    a = Server(d, "s8b-a", lifetime=40, BACKGROUND_CLEANUP_ENABLED="true",
+               DELETE_FAIL_PARTITIONS="P0004").start()
+    st = wait_for_status(a.port, "P0004", "delete_failed", 12)
+    ok("S8b 失败分区进入 delete_failed", st.get("status") == "delete_failed")
+    # 向后校时 -3600s
+    set_clock_offset(d, -3600)
+    time.sleep(0.5)
+    _, cst = http("GET", a.port, "/cleanup/status")
+    fail = next(x for x in cst["failures"] if x["partition_id"] == "P0004")
+    ok("S8b 后跳瞬间重试倒计时仍按实际时长继续", fail["retry_remaining_seconds"] is not None
+       and fail["retry_remaining_seconds"] >= 0, str(fail["retry_remaining_seconds"]))
+    # 等单调重试间隔（3s）过去；墙钟倒退不应让它继续等待
+    time.sleep(4)
+    _, cst = http("GET", a.port, "/cleanup/status")
+    fail = next((x for x in cst["failures"] if x["partition_id"] == "P0004"), None)
+    st = partition_status(a.port, "P0004")
+    ok("S8b 实际经过重试间隔后仍处 delete_failed（注入未解除，反复重试不谎报成功）",
+       st["status"] == "delete_failed" and fail is not None)
+    # 重试确实在按单调钟发生：attempts 应 >1
+    ok("S8b 墙钟倒退期间重试按单调钟持续发生", st["delete_attempts"] >= 2,
+       f"attempts={st['delete_attempts']}")
+    a.wait_dead()
+
+
+# ----------------------------- S9：容器单独/全部重启不重计期限
+def scenario_restart_keeps_deadlines() -> None:
+    print("== S9 同宿主启动周期内重启：单调期限连续，不重计 ==")
+
+    # --- S9a 执行进程退出后，租约到期仍可接管（重启前后单调读数同源）---
+    d = fresh_dir("lk-s9a")
+    s1 = Server(d, "s9a", lifetime=12, BACKGROUND_CLEANUP_ENABLED="false").start()
+    db_set_deleting_mono(d, "P0001", lease_delay_s=5)
+    s1.wait_dead()
+    s2 = Server(d, "s9b", lifetime=24, BACKGROUND_CLEANUP_ENABLED="true").start()
+    _, meta = http("GET", s2.port, "/meta/info")
+    ok("S9a 重启后 boot_id 不变（同一宿主启动周期）",
+       meta["clock"]["boot_id"] == clock.boot_id())
+    t0 = time.time()
+    st = wait_for_status(s2.port, "P0001", "cleaned", 10)
+    elapsed = time.time() - t0
+    ok("S9a 重启后租约按原单调时刻到期并被接管", st.get("status") == "cleaned",
+       f"{st.get('status')} wait={elapsed:.1f}s")
+    ok("S9a 接管发生在原租约到期附近而非重新计满 4s", elapsed <= 7, f"{elapsed:.1f}s")
+
+    # --- S9b delete_failed 行的重试期限跨重启不重计 ---
+    d = fresh_dir("lk-s9b")
+    s1 = Server(d, "s9c", lifetime=16, BACKGROUND_CLEANUP_ENABLED="true",
+                DELETE_FAIL_PARTITIONS="P0004").start()
+    st = wait_for_status(s1.port, "P0004", "delete_failed", 12)
+    attempts_before = st["delete_attempts"]
+    ok("S9b 重启前已进入 delete_failed", st.get("status") == "delete_failed")
+    s1.wait_dead()
+    # 重启前先把重试间隔几乎等完
+    time.sleep(2.5)
+    s2 = Server(d, "s9d", lifetime=22, BACKGROUND_CLEANUP_ENABLED="true",
+                DELETE_FAIL_PARTITIONS="P0004").start()
+    time.sleep(3)  # 若重计 3s，这段时间内不会有新尝试；若连续则已再次重试
+    st = partition_status(s2.port, "P0004")
+    ok("S9b 重启不重计重试期限：后台循环很快再次重试",
+       st["status"] == "delete_failed" and st["delete_attempts"] > attempts_before,
+       f"before={attempts_before} after={st['delete_attempts']}")
+
+
+# ----------------------------- S10：写锁等待（busy_timeout 串行，不报错）
+def scenario_lock_wait() -> None:
+    print("== S10 SQLite 写锁被占时清理事务等待而非失败 ==")
+    d = fresh_dir("lk-s10")
+    s = Server(d, "s10", lifetime=30, BACKGROUND_CLEANUP_ENABLED="false").start()
+    holder = sqlite3.connect(str(d / "datalake.db"), timeout=30,
+                             isolation_level=None, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")  # 占住写锁
+
+    def release_lock():
+        time.sleep(3)  # 让清理请求先在 busy_timeout 上等待
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    threading.Thread(target=release_lock, daemon=True).start()
+    try:
+        t0 = time.time()
+        code, res = http("POST", s.port, "/cleanup/run")
+        waited = time.time() - t0
+        ok("S10 锁等待期间请求不报错，拿到锁后正常完成",
+           code == 200 and len(res.get("outcomes", [])) == 5,
+           f"code={code} waited={waited:.1f}s outcomes={res.get('outcomes')}")
+        ok("S10 确实经历了锁等待（>=2s）", waited >= 2.0, f"{waited:.1f}s")
+    finally:
+        try:
+            holder.execute("ROLLBACK")
+            holder.close()
+        except sqlite3.Error:
+            pass
+    # 锁释放后再次清理应立即返回（没有新分区）
+    code, res = http("POST", s.port, "/cleanup/run")
+    ok("S10 锁释放后清理即时返回", code == 200 and res["outcomes"] == [])
+
+
+# ----------------------------- S11：旧版墙钟记录迁移后可恢复
+def scenario_legacy_rows_recover() -> None:
+    print("== S11 仅有墙钟期限的 deleting/delete_failed 记录迁移后可恢复 ==")
+    d = fresh_dir("lk-s11")
+    s1 = Server(d, "s11a", lifetime=14, BACKGROUND_CLEANUP_ENABLED="false").start()
+    # 旧版 deleting：墙钟租约写在“很久以后”，但单调列为 NULL
+    db_set_deleting(d, "P0001", lease_delay_s=86400, delete_file=False)
+    # 旧版 delete_failed：墙钟重试时刻写在“很久以后”，单调列为 NULL
+    conn = sqlite3.connect(str(d / "datalake.db"), isolation_level=None)
+    conn.execute(
+        "UPDATE partitions SET status='delete_failed', last_error='legacy wall error', "
+        "next_retry_ms=?, delete_attempts=1 WHERE partition_id='P0002'",
+        (int((time.time() + 86400) * 1000),),
+    )
+    conn.close()
+    s1.wait_dead()
+
+    s2 = Server(d, "s11b", lifetime=24, BACKGROUND_CLEANUP_ENABLED="true").start()
+    st1 = wait_for_status(s2.port, "P0001", "cleaned", 12)
+    st2 = wait_for_status(s2.port, "P0002", "cleaned", 12)
+    ok("S11 旧版 deleting（墙钟租约未到期）迁移后立即被接管回收",
+       st1.get("status") == "cleaned", st1.get("status", ""))
+    ok("S11 旧版 delete_failed（墙钟重试未到）迁移后立即重试并回收",
+       st2.get("status") == "cleaned", st2.get("status", ""))
+    # 迁移后的新认领写入单调期限列与 boot 标识
+    conn = sqlite3.connect(str(d / "datalake.db"), isolation_level=None)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(partitions)")}
+    conn.close()
+    ok("S11 旧库已在线迁移出单调期限列",
+       {"delete_lease_mono_ns", "next_retry_mono_ns", "deadline_boot_id"} <= cols,
+       str(sorted(cols)))
+
+
 def main() -> int:
     scenarios = [
         scenario_restart_idempotent,
@@ -344,6 +549,10 @@ def main() -> int:
         scenario_reconcile,
         scenario_preservation_semantics,
         scenario_operable_during_cleanup,
+        scenario_clock_jump_immunity,
+        scenario_restart_keeps_deadlines,
+        scenario_lock_wait,
+        scenario_legacy_rows_recover,
     ]
     only = sys.argv[1:] if len(sys.argv) > 1 else None
     for sc in scenarios:

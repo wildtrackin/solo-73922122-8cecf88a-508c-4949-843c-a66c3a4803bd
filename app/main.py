@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from . import config
+from . import clock, config
 from .cleanup import cleanup_loop
 from .db import init_db
 from .routes import cleanup as cleanup_routes
@@ -83,7 +83,13 @@ app.include_router(cleanup_routes.router)
 
 @app.get("/health", tags=["meta"], summary="健康检查")
 def health() -> dict:
-    return {"status": "ok", "process": config.OWNER, "now": ms_to_iso(now_ms())}
+    return {
+        "status": "ok",
+        "process": config.OWNER,
+        "now": ms_to_iso(now_ms()),
+        "boot_id": clock.boot_id(),
+        "wall_offset_seconds": clock.wall_offset_seconds(),
+    }
 
 
 @app.get("/meta/info", tags=["meta"], summary="进程与存储信息")
@@ -96,5 +102,14 @@ def meta_info() -> dict:
         "background_cleanup_enabled": config.BACKGROUND_CLEANUP_ENABLED,
         "cleanup_interval_seconds": config.CLEANUP_INTERVAL_SECONDS,
         "delete_lease_seconds": config.DELETE_LEASE_SECONDS,
+        "delete_retry_seconds": config.DELETE_RETRY_SECONDS,
         "delete_fail_partitions": sorted(config.DELETE_FAIL_PARTITIONS),
+        "slow_delete_partitions": sorted(config.SLOW_DELETE_PARTITIONS),
+        "clock": {
+            "boot_id": clock.boot_id(),
+            "monotonic_ns": clock.mono_ns(),
+            "wall_offset_seconds": clock.wall_offset_seconds(),
+            "clock_offset_file": config.CLOCK_OFFSET_FILE,
+            "note": "清理租约/重试按单调钟实际经过时长判定，墙钟校时不改变期限",
+        },
     }
